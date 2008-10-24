@@ -287,13 +287,16 @@ static CGColorSpaceRef GetSRGBColorSpace() {
 }
 
 static NSMutableDictionary *fontIDCache = nil;
+static ATSUFontID fontCount=-1, *fontIDs = NULL;
 
 static void CleanupFontIDCache() __attribute__((destructor));
 static void CleanupFontIDCache()
 {
 	NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 	if (fontIDCache) [fontIDCache release];
+	if (fontIDs) free(fontIDs);
 	fontIDCache = nil;
+	fontIDs = NULL;
 	[pool release];
 }
 
@@ -315,15 +318,12 @@ static ATSUFontID GetFontIDForSSAName(NSString *name)
 	
 	if (font == kATSUInvalidFontID) font = ATSFontFindFromName((CFStringRef)name, kATSOptionFlagsDefault); // for bugs in ATS under 10.4
 	if (font == kATSUInvalidFontID) { // try a case-insensitive search
-		ItemCount fontCount;
-		ATSUFontCount(&fontCount);
-		
-		ATSUFontID fontIDs[fontCount];
-		ItemCount arraySize = fontCount;
-		ATSUGetFontIDs(fontIDs, arraySize, &fontCount);
-		
-		// I do not want to call ATSUFindFontName twice 
-		// so I make the buffer large enough.
+		if (fontCount == -1) {
+			ATSUFontCount(&fontCount);
+			fontIDs = malloc(sizeof(ATSUFontID[fontCount]));
+			ATSUGetFontIDs(fontIDs, fontCount, &fontCount);
+		}
+				
 		ByteCount len;
 		ItemCount x, index;
 		const ByteCount kBufLength = 1024/sizeof(unichar);
@@ -349,17 +349,19 @@ static ATSUFontID GetFontIDForSSAName(NSString *name)
 
 -(void*)completedStyleParsing:(SubStyle*)s
 {
-	const ATSUAttributeTag tags[] = {kATSUStyleRenderingOptionsTag, kATSUSizeTag, kATSUQDBoldfaceTag, kATSUQDItalicTag, kATSUQDUnderlineTag, kATSUStyleStrikeThroughTag, kATSUFontTag};
-	const ByteCount		 sizes[] = {sizeof(ATSStyleRenderingOptions), sizeof(Fixed), sizeof(Boolean), sizeof(Boolean), sizeof(Boolean), sizeof(Boolean), sizeof(ATSUFontID)};
+	const ATSUAttributeTag tags[] = {kATSUStyleRenderingOptionsTag, kATSUSizeTag, kATSUQDBoldfaceTag, kATSUQDItalicTag, kATSUQDUnderlineTag, kATSUStyleStrikeThroughTag, kATSUFontTag, kATSUVerticalCharacterTag};
+	const ByteCount		 sizes[] = {sizeof(ATSStyleRenderingOptions), sizeof(Fixed), sizeof(Boolean), sizeof(Boolean), sizeof(Boolean), sizeof(Boolean), sizeof(ATSUFontID), sizeof(ATSUVerticalCharacterType)};
 	
-	ATSUFontID font = GetFontIDForSSAName(s->fontname);
+	NSString *fn = s->fontname;
+	ATSUVerticalCharacterType vertical = ParseFontVerticality(&fn) ? kATSUStronglyVertical : kATSUStronglyHorizontal;
+	ATSUFontID font = GetFontIDForSSAName(fn);
 	ATSFontRef fontRef = font;
 	ATSStyleRenderingOptions opt = kATSStyleApplyAntiAliasing;
 	Fixed size;
 	Boolean b = s->bold, i = s->italic, u = s->underline, st = s->strikeout;
 	ATSUStyle style;
 		
-	const ATSUAttributeValuePtr vals[] = {&opt, &size, &b, &i, &u, &st, &font};
+	const ATSUAttributeValuePtr vals[] = {&opt, &size, &b, &i, &u, &st, &font, &vertical};
 	
 	if (!s->platformSizeScale) s->platformSizeScale = GetWinFontSizeScale(fontRef);
 	size = FloatToFixed(s->size * s->platformSizeScale * screenScaleY);
@@ -367,7 +369,7 @@ static ATSUFontID GetFontIDForSSAName(NSString *name)
 	ATSUCreateStyle(&style);
 	ATSUSetAttributes(style, sizeof(tags) / sizeof(ATSUAttributeTag), tags, sizes, vals);
 	
-	if (s->tracking) {
+	if (s->tracking > 0) { // bug in VSFilter: negative tracking in style lines is ignored
 		Fixed tracking = FloatToFixed(s->tracking);
 		
 		SetATSUStyleOther(style, kATSUAfterWithStreamShiftTag, sizeof(Fixed), &tracking);
@@ -461,9 +463,13 @@ enum {renderMultipleParts = 1, // call ATSUDrawText more than once, needed for c
 		case tag_fn:
 			sv();
 			{
+				ATSUVerticalCharacterType vertical = ParseFontVerticality(&sval) ? kATSUStronglyVertical : kATSUStronglyHorizontal;
 				ATSUFontID font = GetFontIDForSSAName(sval);
 				
-				if (font) SetATSUStyleOther(spanEx->style, kATSUFontTag, sizeof(ATSUFontID), &font);
+				if (font) {
+					SetATSUStyleFlag(spanEx->style, kATSUVerticalCharacterTag, vertical);
+					SetATSUStyleOther(spanEx->style, kATSUFontTag, sizeof(ATSUFontID), &font);
+				}
 			}
 			break;
 		case tag_fs:
@@ -494,16 +500,14 @@ enum {renderMultipleParts = 1, // call ATSUDrawText more than once, needed for c
 			break;
 		case tag_fscx:
 			fv();
-			fval /= 100.;
-			mat = CGAffineTransformMakeScale(fval, spanEx->scaleY);
-			spanEx->scaleX = fval;
+			spanEx->scaleX = fval / 100.;
+			mat = CGAffineTransformMakeScale(spanEx->scaleX, spanEx->scaleY);
 			SetATSUStyleOther(spanEx->style, kATSUFontMatrixTag, sizeof(CGAffineTransform), &mat);
 			break;
 		case tag_fscy:
 			fv();
-			fval /= 100.;
-			mat = CGAffineTransformMakeScale(spanEx->scaleX, fval);
-			spanEx->scaleY = fval;
+			spanEx->scaleY = fval / 100.;
+			mat = CGAffineTransformMakeScale(spanEx->scaleX, spanEx->scaleY);
 			SetATSUStyleOther(spanEx->style, kATSUFontMatrixTag, sizeof(CGAffineTransform), &mat);
 			break;
 		case tag_fsp:
@@ -994,6 +998,7 @@ static Fixed DrawOneTextDiv(CGContextRef c, ATSUTextLayout layout, SubRenderDiv 
 	CGContextSetLineCap(c, kCGLineCapRound);
 	CGContextSetLineJoin(c, kCGLineJoinRound);
 	CGContextSetInterpolationQuality(c, kCGInterpolationHigh);
+	CGContextSetShouldSmoothFonts(c, NO); //disables subpixel AA for some reason
 	
 	for (i = 0; i < div_count; i++) {
 		SubRenderDiv *div = [divs objectAtIndex:i];

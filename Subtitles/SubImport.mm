@@ -99,6 +99,8 @@ Track CreatePlaintextSubTrack(Movie theMovie, ImageDescriptionHandle imgDesc,
 	(*imgDesc)->depth = 32;
 	(*imgDesc)->clutID = -1;
 	
+	if (!trackWidth || !trackHeight) {trackWidth = IntToFixed(640); trackHeight = IntToFixed(480);}
+	
 	if (imageExtension) AddImageDescriptionExtension(imgDesc, imageExtension, subType);
 	
 	theTrack = NewMovieTrack(theMovie, trackWidth, trackHeight, kNoVolume);
@@ -1043,11 +1045,12 @@ restart:
 CXXSubSerializer::CXXSubSerializer()
 {
 	priv = [[SubSerializer alloc] init];
+    CFRetain(priv);
 }
 
 CXXSubSerializer::~CXXSubSerializer()
 {
-	if (priv) {[(SubSerializer*)priv release]; priv = NULL;}
+	if (priv) {CFRelease(priv); [(SubSerializer*)priv release]; priv = NULL;}
 }
 
 void CXXSubSerializer::pushLine(const char *line, size_t size, unsigned start, unsigned end)

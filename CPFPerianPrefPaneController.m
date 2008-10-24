@@ -1,6 +1,5 @@
 #import "CPFPerianPrefPaneController.h"
 #import "UpdateCheckerAppDelegate.h"
-#import "ECQTComponent.h"
 #include <sys/stat.h>
 
 #define AC3DynamicRangeKey CFSTR("dynamicRange")
@@ -228,6 +227,9 @@
 			userInstalled = NO;
 		else
 			userInstalled = YES;
+
+#warning TODO(durin42) Should filter out components that aren't installed from this list.
+		componentReplacementInfo = [[NSArray alloc] initWithContentsOfFile:[[[self bundle] resourcePath] stringByAppendingPathComponent:ComponentInfoPlist]];
 	}
 	
 	return self;
@@ -359,8 +361,8 @@
 	[updateDate release];
 	
 	/* A52 Prefs */
-	unsigned twoChannelMode = [self getIntFromKey:AC3TwoChannelModeKey forAppID:a52AppID withDefault:0xffffffff];
-	if (twoChannelMode != 0xffffffff)
+	int twoChannelMode = [self getIntFromKey:AC3TwoChannelModeKey forAppID:a52AppID withDefault:0xffffffff];
+	if(twoChannelMode != 0xffffffff)
 	{
 		/* sanity checks */
 		if(twoChannelMode & A52_CHANNEL_MASK & 0xf7 != 2)
@@ -400,12 +402,14 @@
 }
 
 - (void) dealloc {
+	[[NSDistributedNotificationCenter defaultCenter] removeObserver:self name:UPDATE_STATUS_NOTIFICATION object:nil];
 	[perianForumURL release];
 	[perianDonateURL release];
 	[perianWebSiteURL release];
 	if(auth != nil)
 		AuthorizationFree(auth, 0);
 	[errorString release];
+	[componentReplacementInfo release];
 	[super dealloc];
 }
 
@@ -643,6 +647,8 @@
 	NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 	NSDictionary *infoDict = [self myInfoDict];
 	NSDictionary *myComponentsInfo = [infoDict objectForKey:ComponentInfoDictionaryKey];
+	NSFileManager *fileManager = [NSFileManager defaultManager];
+	NSString *componentPath;
 
 	[errorString release];
 	errorString = [[NSMutableString alloc] init];
@@ -651,12 +657,11 @@
 		/* Oh well, hope we don't need it */
 		auth = nil;
 	
-	int tag = 0;
-	BOOL result = NO;
+	componentPath = [[self quickTimeComponentDir:userInstalled] stringByAppendingPathComponent:@"Perian.component"];
 	if(auth != nil && !userInstalled)
-		[self _authenticatedRemove:[[self quickTimeComponentDir:userInstalled] stringByAppendingPathComponent:@"Perian.component"]];
+		[self _authenticatedRemove:componentPath];
 	else
-		result = [[NSWorkspace sharedWorkspace] performFileOperation:NSWorkspaceRecycleOperation source:[self quickTimeComponentDir:userInstalled] destination:@"" files:[NSArray arrayWithObject:@"Perian.component"] tag:&tag];
+		[fileManager removeFileAtPath:componentPath handler:nil];
 	
 	NSEnumerator *componentEnum = [myComponentsInfo objectEnumerator];
 	NSDictionary *myComponent = nil;
@@ -664,10 +669,11 @@
 	{
 		ComponentType type = [[myComponent objectForKey:ComponentTypeKey] intValue];
 		NSString *directory = [self basePathForType:type user:userInstalled];
+		componentPath = [directory stringByAppendingPathComponent:[myComponent objectForKey:ComponentNameKey]];
 		if(auth != nil && !userInstalled)
-			[self _authenticatedRemove:[directory stringByAppendingPathComponent:[myComponent objectForKey:ComponentNameKey]]];
+			[self _authenticatedRemove:componentPath];
 		else
-			result = [[NSWorkspace sharedWorkspace] performFileOperation:NSWorkspaceRecycleOperation source:directory destination:@"" files:[NSArray arrayWithObject:[myComponent objectForKey:ComponentNameKey]] tag:&tag];
+			[fileManager removeFileAtPath:componentPath handler:nil];
 	}
 	if(auth != nil)
 	{
@@ -681,7 +687,6 @@
 
 - (IBAction)installUninstall:(id)sender
 {
-	[progress_install startAnimation:sender];
 	if(installStatus == InstallStatusInstalled)
 		[NSThread detachNewThreadSelector:@selector(uninstall:) toTarget:self withObject:nil];
 	else
@@ -690,16 +695,109 @@
 
 - (void)installComplete:(id)sender
 {
-	[progress_install stopAnimation:sender];
 	[self checkForInstallation];
 }
 
+#pragma mark Component Version List
+- (NSArray *)installedComponentsForUser:(BOOL)user
+{
+	NSString *path = [self basePathForType:ComponentTypeQuickTime user:user];
+	NSArray *installedComponents = [[NSFileManager defaultManager] directoryContentsAtPath:path];
+	NSMutableArray *retArray = [[NSMutableArray alloc] initWithCapacity:[installedComponents count]]; 
+	NSEnumerator *componentEnum = [installedComponents objectEnumerator];
+	NSString *component;
+	while ((component = [componentEnum nextObject])) {
+		if ([[component pathExtension] isEqualToString:@"component"])
+			[retArray addObject:component];
+	}
+	return [retArray autorelease];
+}
+
+- (NSDictionary *)componentInfoForComponent:(NSString *)component userInstalled:(BOOL)user
+{
+	NSString *compName = component;
+	if ([[component pathExtension] isEqualToString:@"component"])
+		compName = [component stringByDeletingPathExtension];
+	NSMutableDictionary *componentInfo = [[NSMutableDictionary alloc] initWithObjectsAndKeys:compName, @"name", NULL];
+	NSBundle *componentBundle = [NSBundle bundleWithPath:[[self basePathForType:ComponentTypeQuickTime 
+																		   user:user] stringByAppendingPathComponent:component]];
+	NSDictionary *infoDictionary = nil;
+	if (componentBundle)
+		infoDictionary = [componentBundle infoDictionary];
+	if (infoDictionary && [infoDictionary objectForKey:BundleIdentifierKey]) {
+		NSString *componentVersion = [infoDictionary objectForKey:BundleVersionKey];
+		if (componentVersion)
+			[componentInfo setObject:componentVersion forKey:@"version"];
+		else
+			[componentInfo setObject:@"Unknown" forKey:@"version"];
+		[componentInfo setObject:(user ? @"User" : @"System") forKey:@"installType"];
+		[componentInfo setObject:[self checkComponentStatusByBundleIdentifier:[componentBundle bundleIdentifier]] forKey:@"status"];
+		[componentInfo setObject:[componentBundle bundleIdentifier] forKey:@"bundleID"];
+	} else {
+		[componentInfo setObject:@"Unknown" forKey:@"version"];
+		[componentInfo setObject:(user ? @"User" : @"System") forKey:@"installType"];
+		NSString *bundleIdent = [NSString stringWithFormat:PERIAN_NO_BUNDLE_ID_FORMAT,compName];
+		[componentInfo setObject:[self checkComponentStatusByBundleIdentifier:bundleIdent] forKey:@"status"];
+		[componentInfo setObject:bundleIdent forKey:@"bundleID"];
+	}
+	return [componentInfo autorelease];
+}
+
+- (NSArray *)installedComponents
+{
+	NSArray *userComponents = [self installedComponentsForUser:YES];
+	NSArray *systemComponents = [self installedComponentsForUser:NO];
+	unsigned numComponents = [userComponents count] + [systemComponents count];
+	NSMutableArray *components = [[NSMutableArray alloc] initWithCapacity:numComponents];
+	NSEnumerator *compEnum = [userComponents objectEnumerator];
+	NSString *compName;
+	while ((compName = [compEnum nextObject]))
+		[components addObject:[self componentInfoForComponent:compName userInstalled:YES]];
+	
+	compEnum = [systemComponents objectEnumerator];
+	while ((compName = [compEnum nextObject]))
+		[components addObject:[self componentInfoForComponent:compName userInstalled:NO]];
+	return [components autorelease];
+}
+
+- (NSString *)checkComponentStatusByBundleIdentifier:(NSString *)bundleID
+{
+	NSString *status = @"OK";
+	NSEnumerator *infoEnum = [componentReplacementInfo objectEnumerator];
+	NSDictionary *infoDict;
+	while ((infoDict = [infoEnum nextObject])) {
+		NSEnumerator *stringsEnum = [[infoDict objectForKey:ObsoletesKey] objectEnumerator];
+		NSString *obsoletedID;
+		while ((obsoletedID = [stringsEnum nextObject]))
+			if ([obsoletedID isEqualToString:bundleID])
+				status = [NSString stringWithFormat:@"Obsoleted by %@",[infoDict objectForKey:HumanReadableNameKey]];
+	}
+	return status;
+}
+
 #pragma mark Check Updates
+- (void)updateCheckStatusChanged:(NSNotification*)notification
+{
+	NSString *status = [notification object];
+	
+	//FIXME localize these
+	if ([status isEqualToString:@"Starting"]) {
+		[textField_updateStatus setStringValue:@"Checking..."];
+	} else if ([status isEqualToString:@"Error"]) {
+		[textField_updateStatus setStringValue:@"Couldn't reach the update server."];
+	} else if ([status isEqualToString:@"NoUpdates"]) {
+		[textField_updateStatus setStringValue:@"There are no updates."];
+	} else if ([status isEqualToString:@"NoUpdates"]) {
+		[textField_updateStatus setStringValue:@"Updates found!"];
+	}
+}
+
 - (IBAction)updateCheck:(id)sender 
 {
 	FSRef updateCheckRef;
 	
-	CFPreferencesSetAppValue((CFStringRef)NEXT_RUN_KEY, NULL, perianAppID);
+	[[NSDistributedNotificationCenter defaultCenter] removeObserver:self name:UPDATE_STATUS_NOTIFICATION object:nil];
+	[[NSDistributedNotificationCenter defaultCenter] addObserver:self selector:@selector(updateCheckStatusChanged:) name:UPDATE_STATUS_NOTIFICATION object:nil];
 	CFPreferencesSetAppValue((CFStringRef)MANUAL_RUN_KEY, [NSNumber numberWithBool:YES], perianAppID);
 	CFPreferencesAppSynchronize(perianAppID);
 	OSStatus status = FSPathMakeRef((UInt8 *)[[[[self bundle] bundlePath] stringByAppendingPathComponent:@"Contents/Resources/PerianUpdateChecker.app"] fileSystemRepresentation], &updateCheckRef, NULL);
@@ -716,6 +814,8 @@
 		CFPreferencesSetAppValue(key, [NSDate dateWithTimeIntervalSinceNow:TIME_INTERVAL_TIL_NEXT_RUN], perianAppID);
 	else
 		CFPreferencesSetAppValue(key, [NSDate distantFuture], perianAppID);
+    
+    CFPreferencesAppSynchronize(perianAppID);
 } 
 
 
@@ -817,6 +917,7 @@
 - (IBAction)setLoadExternalSubtitles:(id)sender
 {	
 	[self setKey:ExternalSubtitlesKey forAppID:perianAppID fromBool:(BOOL)[sender state]];
+    CFPreferencesAppSynchronize(perianAppID);
 }
 
 #pragma mark About 
@@ -838,48 +939,4 @@
 	
 }
 
-#pragma mark Component Manager
-- (NSArray *)installedComponents
-{
-	NSMutableArray *mComps = [[NSMutableArray alloc] init];
-	
-	NSMutableArray* allComps = [NSMutableArray array];
-	
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"/Library/Components")];
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"/Library/QuickTime")];
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"~/Library/QuickTime")];
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"~/Library/Components")];
-	
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"/Library/Components (Disabled)")];
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"/Library/QuickTime (Disabled)")];
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"~/Library/QuickTime (Disabled)")];
-	[allComps addObjectsFromArray:	GetComponentsInFolder(@"~/Library/Components (Disabled)")];
-
-	unsigned x= 0;
-	for (x = 0; x < [allComps count]; x++)
-	{	
-		NSString* comp = [allComps objectAtIndex:x];
-		ECQTComponent* compobj = [ECQTComponent componentWithPath:comp];
-		if (compobj && [compobj name])
-			[mComps addObject:compobj];
-	}
-	return [mComps autorelease];
-}
-
 @end
-
-NSArray* GetComponentsInFolder(NSString* folder)
-{
-	folder = [folder stringByExpandingTildeInPath];
-	NSFileManager* fm = [NSFileManager defaultManager];
-	NSArray* contents = [fm directoryContentsAtPath:folder];
-	NSMutableArray* newContents = [NSMutableArray array];
-	unsigned x;
-	for (x = 0; x < [contents count]; x++)
-	{
-		NSString* comp = [contents objectAtIndex:x];
-		
-		[newContents addObject:[folder stringByAppendingPathComponent:comp]];
-	}
-	return newContents;
-}

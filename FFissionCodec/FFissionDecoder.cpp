@@ -47,6 +47,7 @@ static const CodecPair kAllInputFormats[] =
 	{ 0x6d730050, CODEC_ID_MP2 },
 	{ kAudioFormatTTA, CODEC_ID_TTA },
 	{ kAudioFormatDTS, CODEC_ID_DTS },
+	{ kAudioFormatNellymoser, CODEC_ID_NELLYMOSER },
 	{ 0, CODEC_ID_NONE }
 };
 
@@ -285,7 +286,7 @@ void FFissionDecoder::OpenAVCodec()
 	avContext->channels = mInputFormat.mChannelsPerFrame;
 	avContext->block_align = mInputFormat.mBytesPerPacket;
 	avContext->frame_size = mInputFormat.mFramesPerPacket;
-	avContext->bits_per_sample = mInputFormat.mBitsPerChannel;
+	avContext->bits_per_coded_sample = mInputFormat.mBitsPerChannel;
 	
 	if (avContext->sample_rate == 0) {
 		Codecprintf(NULL, "Invalid sample rate %d\n", avContext->sample_rate);
